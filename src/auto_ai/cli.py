@@ -1,10 +1,17 @@
+#!/usr/bin/env python3
+
 from __future__ import annotations
 
 import argparse
+import fcntl
 import logging
+import os
 import re
 import signal
+import struct
 import sys
+import termios
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -31,13 +38,17 @@ PROMPT_CUE_REGEX = re.compile(
 MENU_IDLE_SECONDS = 0.80
 MENU_MATCH_TIMEOUT_SECONDS = 10.0
 SCAN_WINDOW_LINES = 24
-READ_POLL_SECONDS = 0.20
+STATE_POLL_SECONDS = 0.05
 HANDLED_FINGERPRINT_LIMIT = 64
 STATE_DIR = Path.home() / ".local" / "state" / "auto-ai"
 STATE_FILE = STATE_DIR / "enabled"
 LOG_FILE = STATE_DIR / "auto-ai.log"
 DEFAULT_ENABLED = True
 LOG_RAW_OUTPUT = True
+
+KITTY_KEYBOARD_ENABLE = b"\x1b[>1u"
+KITTY_KEYBOARD_DISABLE = b"\x1b[<u"
+EMERGENCY_STOP_BYTES = b"\x1b[97;6u"
 
 ANSI_ESCAPE_RE = re.compile(
     r"\x1B(?:"
@@ -234,6 +245,162 @@ def handle_state_command(ns: argparse.Namespace) -> int:
     return -1
 
 
+def longest_prefix_suffix(data: bytes, prefix: bytes) -> int:
+    max_len = min(len(data), len(prefix) - 1)
+    for size in range(max_len, 0, -1):
+        if data.endswith(prefix[:size]):
+            return size
+    return 0
+
+
+class AutoAIController:
+    def __init__(self, child: pexpect.spawn, logger: logging.Logger) -> None:
+        self.child = child
+        self.logger = logger
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.parse_buffer = ""
+        self.last_output_time = time.monotonic()
+        self.candidate: Optional[Candidate] = None
+        self.handled = deque(maxlen=HANDLED_FINGERPRINT_LIMIT)
+        self.last_enabled = read_enabled_state()
+        self.pending_input = b""
+        self.kitty_keyboard_active = False
+
+    def emit_notice(self, message: str) -> None:
+        try:
+            os.write(sys.stderr.fileno(), f"\r\n{message}\r\n".encode("utf-8"))
+        except OSError:
+            pass
+
+    def enable_keyboard_protocol(self) -> None:
+        is_kitty = os.environ.get("TERM") == "xterm-kitty" or bool(
+            os.environ.get("KITTY_WINDOW_ID")
+        )
+        if not sys.stdout.isatty() or not is_kitty:
+            return
+        try:
+            os.write(sys.stdout.fileno(), KITTY_KEYBOARD_ENABLE)
+            self.kitty_keyboard_active = True
+            self.logger.info("enabled kitty keyboard protocol")
+        except OSError:
+            self.logger.info("failed to enable kitty keyboard protocol")
+
+    def disable_keyboard_protocol(self) -> None:
+        if not sys.stdout.isatty() or not self.kitty_keyboard_active:
+            return
+        try:
+            os.write(sys.stdout.fileno(), KITTY_KEYBOARD_DISABLE)
+            self.logger.info("restored previous keyboard protocol")
+        except OSError:
+            self.logger.info("failed to restore previous keyboard protocol")
+
+    def handle_child_output(self, data: bytes) -> bytes:
+        now = time.monotonic()
+        text = data.decode("utf-8", "replace")
+
+        with self.lock:
+            self.last_output_time = now
+
+            if LOG_RAW_OUTPUT:
+                self.logger.info("raw %r", text)
+
+            self.parse_buffer += strip_control_sequences(text)
+            if len(self.parse_buffer) > 16000:
+                self.parse_buffer = self.parse_buffer[-16000:]
+
+            match = find_menu_match(self.parse_buffer)
+            if match and match.fingerprint not in self.handled:
+                if self.candidate and self.candidate.match.fingerprint == match.fingerprint:
+                    self.candidate.last_seen = now
+                else:
+                    self.candidate = Candidate(match=match, first_seen=now, last_seen=now)
+                    self.logger.info(
+                        "menu candidate numbers=%s response=%s block=%r",
+                        match.numbers,
+                        match.response,
+                        match.block_text,
+                    )
+            elif self.candidate:
+                self.logger.info(
+                    "clearing stale candidate numbers=%s because prompt changed",
+                    self.candidate.match.numbers,
+                )
+                self.candidate = None
+
+        return data
+
+    def _trigger_emergency_stop(self) -> None:
+        write_enabled_state(False)
+        with self.lock:
+            self.candidate = None
+        self.logger.warning("emergency stop activated via ctrl+shift+a")
+        self.emit_notice("[auto-ai emergency stop: disabled]")
+
+    def handle_user_input(self, data: bytes) -> bytes:
+        combined = self.pending_input + data
+        self.pending_input = b""
+        output = bytearray()
+        pos = 0
+
+        while True:
+            hit = combined.find(EMERGENCY_STOP_BYTES, pos)
+            if hit == -1:
+                tail = combined[pos:]
+                keep = longest_prefix_suffix(tail, EMERGENCY_STOP_BYTES)
+                if keep:
+                    output.extend(tail[:-keep])
+                    self.pending_input = tail[-keep:]
+                else:
+                    output.extend(tail)
+                break
+
+            output.extend(combined[pos:hit])
+            self._trigger_emergency_stop()
+            pos = hit + len(EMERGENCY_STOP_BYTES)
+
+        return bytes(output)
+
+    def monitor(self) -> None:
+        while not self.stop_event.is_set():
+            enabled = read_enabled_state()
+            now = time.monotonic()
+
+            with self.lock:
+                if enabled != self.last_enabled:
+                    self.logger.info("state changed enabled=%s", enabled)
+                    self.last_enabled = enabled
+
+                if self.candidate:
+                    if now - self.candidate.first_seen > MENU_MATCH_TIMEOUT_SECONDS:
+                        self.logger.info(
+                            "menu candidate expired numbers=%s block=%r",
+                            self.candidate.match.numbers,
+                            self.candidate.match.block_text,
+                        )
+                        self.candidate = None
+                    elif enabled and now - self.last_output_time >= MENU_IDLE_SECONDS:
+                        self.child.sendline(self.candidate.match.response)
+                        self.handled.append(self.candidate.match.fingerprint)
+                        self.logger.info(
+                            "auto-sent response=%s for menu=%s",
+                            self.candidate.match.response,
+                            self.candidate.match.numbers,
+                        )
+                        self.candidate = None
+
+            time.sleep(STATE_POLL_SECONDS)
+
+    def sigwinch_passthrough(self, _signum: int, _frame: object) -> None:
+        packed = struct.pack("HHHH", 0, 0, 0, 0)
+        rows, cols, _, _ = struct.unpack(
+            "hhhh",
+            fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, packed),
+        )
+        if not self.child.closed:
+            self.child.setwinsize(rows, cols)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run Codex behind a strict numbered-menu auto-responder."
@@ -258,6 +425,10 @@ def main() -> int:
     if state_rc >= 0:
         return state_rc
 
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("auto-ai requires an interactive TTY.", file=sys.stderr)
+        return 2
+
     command = build_command(ns.command)
     logger = setup_logging(Path(ns.log_file).expanduser())
     logger.info("starting wrapper command=%r enabled=%s", command, read_enabled_state())
@@ -265,10 +436,10 @@ def main() -> int:
     child = pexpect.spawn(
         command[0],
         command[1:],
-        encoding="utf-8",
-        codec_errors="replace",
+        encoding=None,
         timeout=None,
     )
+    controller = AutoAIController(child, logger)
 
     def forward_signal(signum: int, _frame: object) -> None:
         logger.info("forwarding signal=%s to child pid=%s", signum, child.pid)
@@ -279,81 +450,30 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, forward_signal)
     signal.signal(signal.SIGTERM, forward_signal)
+    signal.signal(signal.SIGWINCH, controller.sigwinch_passthrough)
+    controller.sigwinch_passthrough(signal.SIGWINCH, None)
 
-    parse_buffer = ""
-    last_output_time = time.monotonic()
-    candidate: Optional[Candidate] = None
-    handled = deque(maxlen=HANDLED_FINGERPRINT_LIMIT)
-    last_enabled = read_enabled_state()
+    monitor_thread = threading.Thread(target=controller.monitor, daemon=True)
+    monitor_thread.start()
 
-    while True:
-        now = time.monotonic()
+    try:
+        controller.enable_keyboard_protocol()
+        if controller.kitty_keyboard_active:
+            controller.emit_notice("[auto-ai running: emergency stop is Ctrl+Shift+A in Kitty]")
+        child.interact(
+            escape_character=None,
+            input_filter=controller.handle_user_input,
+            output_filter=controller.handle_child_output,
+        )
+    finally:
+        controller.stop_event.set()
+        monitor_thread.join(timeout=1.0)
+        controller.disable_keyboard_protocol()
+        child.close()
 
-        try:
-            chunk = child.read_nonblocking(size=4096, timeout=READ_POLL_SECONDS)
-            if chunk:
-                sys.stdout.write(chunk)
-                sys.stdout.flush()
-                last_output_time = now
-
-                if LOG_RAW_OUTPUT:
-                    logger.info("raw %r", chunk)
-
-                parse_buffer += strip_control_sequences(chunk)
-                if len(parse_buffer) > 16000:
-                    parse_buffer = parse_buffer[-16000:]
-
-                match = find_menu_match(parse_buffer)
-
-                if match and match.fingerprint not in handled:
-                    if candidate and candidate.match.fingerprint == match.fingerprint:
-                        candidate.last_seen = now
-                    else:
-                        candidate = Candidate(match=match, first_seen=now, last_seen=now)
-                        logger.info(
-                            "menu candidate numbers=%s response=%s block=%r",
-                            match.numbers,
-                            match.response,
-                            match.block_text,
-                        )
-                elif candidate:
-                    logger.info(
-                        "clearing stale candidate numbers=%s because prompt changed",
-                        candidate.match.numbers,
-                    )
-                    candidate = None
-
-        except pexpect.TIMEOUT:
-            pass
-        except pexpect.EOF:
-            break
-
-        enabled = read_enabled_state()
-        if enabled != last_enabled:
-            logger.info("state changed enabled=%s", enabled)
-            last_enabled = enabled
-
-        now = time.monotonic()
-        if candidate:
-            if now - candidate.first_seen > MENU_MATCH_TIMEOUT_SECONDS:
-                logger.info(
-                    "menu candidate expired numbers=%s block=%r",
-                    candidate.match.numbers,
-                    candidate.match.block_text,
-                )
-                candidate = None
-                continue
-
-            if enabled and now - last_output_time >= MENU_IDLE_SECONDS:
-                child.sendline(candidate.match.response)
-                handled.append(candidate.match.fingerprint)
-                logger.info(
-                    "auto-sent response=%s for menu=%s",
-                    candidate.match.response,
-                    candidate.match.numbers,
-                )
-                candidate = None
-
-    child.close()
     logger.info("wrapper exiting status=%s", child.exitstatus)
     return child.exitstatus if child.exitstatus is not None else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -22,6 +22,7 @@ like a real interactive menu, not ordinary numbered prose.
 - idle timeout before replying
 - local logging
 - runtime enable/disable state file
+- in-process emergency stop while `auto-ai` is running
 - signal forwarding to the wrapped process
 
 ## Install
@@ -63,6 +64,12 @@ auto-ai --disable
 auto-ai --toggle
 ```
 
+Emergency stop:
+
+- In Kitty, while `auto-ai` is running, press `Ctrl+Shift+A`
+- This disables auto replies immediately
+- No Kitty keymap or global hotkey is required
+
 Log file:
 
 ```text
@@ -80,3 +87,9 @@ Log file:
 - the recognized prompt is still at the bottom of the live terminal output
 
 That combination keeps false positives low for daily terminal use.
+
+## Emergency stop behavior
+
+`auto-ai` enables Kitty's keyboard protocol itself while it is running, so
+`Ctrl+Shift+A` is available as an app-local emergency stop in Kitty without any
+terminal config bind. Outside `auto-ai`, the key does nothing special.
